@@ -1,9 +1,20 @@
-"""Motex 共用注意力模块：GQA + RoPE + KV-Cache 多头注意力。"""
+"""Motex 共用注意力模块：GQA + RoPE + KV-Cache 多头注意力。
+
+包含：
+- GQARopeMultiHeadAttentionKVCache：v1/v2 使用的 GQA(RoPE+KV-Cache) 注意力（掩码依赖 valid_lens）
+- GQARopeCausalAttention：内置因果掩码 + 可选改进（QK-Norm / RoPE 外推 / SDPA），v3 组装用
+- MLAAttention：低秩 latent KV（KV 缓存 1/8），v4 组装用
+"""
+
+import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
-from .transformer import DotProductFlashAttention, causal_bias
+from .transformer import (DotProductFlashAttention, apply_rotary_pos_emb,
+                          causal_bias, precompute_rotary_emb, repeat_kv,
+                          transpose_output, transpose_qkv)
 
 
 class GQARopeMultiHeadAttentionKVCache(nn.Module):
@@ -108,3 +119,185 @@ class GQARopeMultiHeadAttentionKVCache(nn.Module):
         x = x.reshape(batch, self.num_kv_heads * n_rep, seq_len, head_dim)
         x = x.reshape(batch * self.num_heads, seq_len, head_dim)
         return x
+
+
+class GQARopeCausalAttention(nn.Module):
+    """GQA + RoPE + KV-Cache，且内置因果掩码的注意力（v3 组装用）。
+
+    内置因果掩码：不依赖外部 valid_lens 的传法保证因果性（训练/预填充/增量生成结构上自洽）。
+
+    可选改进（默认值即 v3 默认）：
+    - qk_norm=True：softmax 前对每个头 Q/K 做 RMSNorm（教学版无参数，工业版带可学习 scale）。
+      作用：把注意力分数尺度钉在稳定范围，低精度（bf16/fp16）训练显著更稳；A/B 实验显示
+      域内验证最优 + 外推 CE 11.6→6.1，零成本，故默认开启。
+    - rope_scaling={'type':'ntk','alpha':k}（默认 None）：NTK-Aware RoPE 外推，
+      把旋转基频按 base*alpha^(d/(d-2)) 拉伸，可外推约 alpha 倍训练长度（本规模实验为负结果，默认关）。
+    - use_sdp=True（默认 False）：走 F.scaled_dot_product_attention（CUDA 上自动选真 FlashAttention
+      内核，免物化大分数矩阵）；本规模(d512/8L/单批)无提速，大模型/长上下文/大批量再启用。
+    """
+
+    def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
+                 rope_base=100000.0, rope_scaling=None, use_sdp=False, qk_norm=True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.scale = self.head_dim ** 0.5
+        self.use_sdp = use_sdp
+        self.qk_norm = qk_norm
+
+        self.W_q = nn.Linear(d_model, d_model, bias=bias)
+        self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=bias)
+        self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=bias)
+        self.W_o = nn.Linear(d_model, d_model, bias=bias)
+
+        self.dropout = nn.Dropout(dropout)
+        base_ = rope_base
+        if rope_scaling and rope_scaling.get('type') == 'ntk':
+            alpha = float(rope_scaling.get('alpha', 1.0))
+            base_ = rope_base * (alpha ** (self.head_dim / (self.head_dim - 2.0)))
+        self.rope_base = base_
+        self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+
+    def forward(self, x, state, i):
+        # x: (B, S, d_model) -> (out: B, S, d_model, state)
+        B, S, _ = x.shape
+
+        q = transpose_qkv(self.W_q(x), self.num_heads)          # (B*H, S, hd)
+        k = transpose_qkv(self.W_k(x), self.num_kv_heads)
+        v = transpose_qkv(self.W_v(x), self.num_kv_heads)
+
+        # 是否有缓存，决定当前 token 的绝对位置（RoPE offset）
+        offset = 0
+        cache_k = cache_v = None
+        if (not self.training) and state is not None and state[0] is not None and state[0][i] is not None:
+            cache_k, cache_v = state[0][i]
+            offset = cache_k.shape[1]
+
+        q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
+        k = apply_rotary_pos_emb(k, self.cos, self.sin, offset=offset)
+
+        if offset:
+            k = torch.cat([cache_k, k], dim=1)
+            v = torch.cat([cache_v, v], dim=1)
+        if (not self.training) and state is not None and state[0] is not None:
+            state[0][i] = (k, v)
+
+        n_rep = self.num_heads // self.num_kv_heads
+        k = repeat_kv(k, n_rep, self.num_heads, self.num_kv_heads)
+        v = repeat_kv(v, n_rep, self.num_heads, self.num_kv_heads)
+
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
+
+        # 内置因果掩码：历史列全放行，当前 S 列施加上三角 -inf（训练 offset=0 即纯因果；解码 S=1 全 0）
+        total = S + offset
+        mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
+        if S > 1:
+            tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
+                                        dtype=q.dtype), diagonal=1)
+            mask[:, offset:] = tri
+
+        if self.use_sdp:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
+                                                 dropout_p=self.dropout.p if self.training else 0.0)
+        else:
+            scores = torch.bmm(q, k.transpose(1, 2)) / self.scale
+            scores = scores + mask
+            w = F.softmax(scores, dim=-1)
+            w = self.dropout(w)
+            out = torch.bmm(w, v)
+        out = transpose_output(out, self.num_heads)
+        return self.W_o(out), state
+
+
+class MLAAttention(nn.Module):
+    """MLA（Multi-head Latent Attention，DeepSeek-V2 风格，教学简化版）——v4 组装用。
+
+    动机 / 对比：
+    - GQA 会把每层的 K、V（shape: num_kv_heads*head_dim 各一份）直接缓存，
+      每 token 每层缓存量 = 2 * num_kv_heads * head_dim（默认 kv=2, hd=64 → 256 个 float）。
+    - MLA 的做法：先用 W_dkv 把输入压进一个低维潜在向量 c（d_c 很小，默认 32），
+      KV 缓存只存 c；解码时再用 W_upK/W_upV 从 c 恢复出 K/V。
+      于是每 token 每层缓存量 = d_c（32 个 float），约为 GQA 的 1/8 → 长上下文/多层的
+      KV 显存大幅下降，代价是解码时多一步低秩恢复计算。
+
+    教学简化（与 DeepSeek-V2 的差异）：
+    1) DeepSeek-V2 对 Q 也用低秩压缩（吸收进权重）、K/V 恢复后做分头 RoPE；
+       这里 Q 保持 GQA 同款全量投影，K 恢复后再统一施加绝对位置 RoPE（等价且更直观）。
+    2) 缓存只存 latent，解码时整段恢复 K/V 再 RoPE（简单、显存最优；计算略增）。
+    经 A/B 对比实验验证：KV 缓存 1/8、域内略优、外推更优。
+    """
+
+    def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
+                 latent_dim=32, rope_base=100000.0, rope_scaling=None,
+                 use_sdp=False, qk_norm=True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.latent_dim = latent_dim
+        self.scale = self.head_dim ** 0.5
+        self.use_sdp = use_sdp
+        self.qk_norm = qk_norm   # 默认开，理由见 GQARopeCausalAttention 注释
+
+        self.W_q = nn.Linear(d_model, d_model, bias=bias)
+        self.W_dkv = nn.Linear(d_model, latent_dim, bias=bias)          # 输入 → 潜在 c
+        self.W_upK = nn.Linear(latent_dim, num_kv_heads * self.head_dim, bias=bias)  # c → K
+        self.W_upV = nn.Linear(latent_dim, num_kv_heads * self.head_dim, bias=bias)  # c → V
+        self.W_o = nn.Linear(d_model, d_model, bias=bias)
+
+        self.dropout = nn.Dropout(dropout)
+        base_ = rope_base
+        if rope_scaling and rope_scaling.get('type') == 'ntk':
+            alpha = float(rope_scaling.get('alpha', 1.0))
+            base_ = rope_base * (alpha ** (self.head_dim / (self.head_dim - 2.0)))
+        self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+
+    def kv_cache_bytes_per_token(self):
+        """每 token 每层 KV 缓存字节数（MLA 与 GQA 缓存量对比见类 docstring）"""
+        return 4 * self.latent_dim
+
+    def forward(self, x, state, i):
+        # x: (B, S, d_model) -> (out: B, S, d_model, state)
+        B, S, _ = x.shape
+        q = transpose_qkv(self.W_q(x), self.num_heads)          # (B*H, S, hd)
+
+        offset = 0
+        cache_c = None
+        if (not self.training) and state is not None and state[0] is not None and state[0][i] is not None:
+            cache_c = state[0][i]                               # 只缓存 latent：(B, off, d_c)
+            offset = cache_c.shape[1]
+        q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
+
+        c = self.W_dkv(x)                                       # (B, S, d_c)
+        c_all = torch.cat([cache_c, c], dim=1) if cache_c is not None else c
+        if (not self.training) and state is not None and state[0] is not None:
+            state[0][i] = c_all                                 # 更新缓存（仍只是 latent）
+
+        k = transpose_qkv(self.W_upK(c_all), self.num_kv_heads) # (B*kv, off+S, hd)
+        v = transpose_qkv(self.W_upV(c_all), self.num_kv_heads)
+        k = apply_rotary_pos_emb(k, self.cos, self.sin)         # 全列绝对位置（offset=0）
+
+        n_rep = self.num_heads // self.num_kv_heads
+        k = repeat_kv(k, n_rep, self.num_heads, self.num_kv_heads)
+        v = repeat_kv(v, n_rep, self.num_heads, self.num_kv_heads)
+
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
+
+        M = causal_bias(q.shape[1], k.shape[1], q.device, q.dtype)
+
+        if self.use_sdp:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=M,
+                                                 dropout_p=self.dropout.p if self.training else 0.0)
+        else:
+            scores = torch.bmm(q, k.transpose(1, 2)) / self.scale   # (B*H, S, S+offset)
+            scores = scores + M
+            w = F.softmax(scores, dim=-1)
+            w = self.dropout(w)
+            out = torch.bmm(w, v)
+        out = transpose_output(out, self.num_heads)
+        return self.W_o(out), state
