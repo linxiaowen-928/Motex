@@ -37,12 +37,17 @@ class GQARopeCausalAttention(nn.Module):
     """
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
-                 rope_base=100000.0, rope_scaling=None):
+                 rope_base=100000.0, rope_scaling=None, use_sdp=False, qk_norm=True):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
         self.scale = self.head_dim ** 0.5
+        self.use_sdp = use_sdp        # 改进④：出前向走 F.scaled_dot_product_attention(FlashAttention 内核)
+        self.qk_norm = qk_norm        # 改进⑤：softmax 前对 Q/K 做 RMSNorm（低精度训练稳定）
+        # 注：qk_norm 默认 True——A/B（dev/IMPROVEMENT_LOG.md 改进项5）显示它域内验证最优、
+        # 外推 CE 从 11.6→6.1 的大幅提升且零成本，故作为 motex_v3 默认；SDPA(use_sdp) 在本规模
+        # (d512/8L/单批) 无速度收益，保留为可选（大模型/长上下文/大批量场景启用）。
 
         self.W_q = nn.Linear(d_model, d_model, bias=bias)
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=bias)
@@ -53,7 +58,6 @@ class GQARopeCausalAttention(nn.Module):
         base_ = rope_base
         if rope_scaling and rope_scaling.get('type') == 'ntk':
             alpha = float(rope_scaling.get('alpha', 1.0))
-            # NTK-Aware：把旋转基频按 alpha 拉伸，见类 docstring
             base_ = rope_base * (alpha ** (self.head_dim / (self.head_dim - 2.0)))
         self.rope_base = base_
         self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
@@ -86,20 +90,32 @@ class GQARopeCausalAttention(nn.Module):
         k = repeat_kv(k, n_rep, self.num_heads, self.num_kv_heads)
         v = repeat_kv(v, n_rep, self.num_heads, self.num_kv_heads)
 
-        scores = torch.bmm(q, k.transpose(1, 2)) / self.scale   # (B*H, S, S+offset)
+        # [改进⑤] QK-Norm：softmax 前对每个头 Q/K 做 RMSNorm（教学版用无参数；工业版带可学习 scale）。
+        # 作用：把注意力分数尺度钉在稳定范围，低精度（bf16/fp16）训练显著更稳、不易爆数。
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         # 内置因果掩码：历史列全放行，当前 S 列施加上三角 -inf（训练 offset=0 即纯因果；解码 S=1 全 0）
         total = S + offset
-        mask = torch.zeros((S, total), device=scores.device, dtype=scores.dtype)
+        mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
         if S > 1:
-            tri = torch.triu(torch.full((S, S), float('-inf'), device=scores.device,
-                                        dtype=scores.dtype), diagonal=1)
+            tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
+                                        dtype=q.dtype), diagonal=1)
             mask[:, offset:] = tri
-        scores = scores + mask
 
-        w = F.softmax(scores, dim=-1)
-        w = self.dropout(w)
-        out = torch.bmm(w, v)
+        if self.use_sdp:
+            # [改进④] 真·FlashAttention：F.scaled_dot_product_attention 在 CUDA 上会自动选择
+            # FlashAttention / Memory-Efficient 内核（不物化超大 attention 分数矩阵 → 提速省显存）。
+            # 注：仓库里以前的 “DotProductFlashAttention” 只是名字叫 Flash 的普通 softmax 注意力。
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
+                                                 dropout_p=self.dropout.p if self.training else 0.0)
+        else:
+            scores = torch.bmm(q, k.transpose(1, 2)) / self.scale
+            scores = scores + mask
+            w = F.softmax(scores, dim=-1)
+            w = self.dropout(w)
+            out = torch.bmm(w, v)
         out = transpose_output(out, self.num_heads)
         return self.W_o(out), state
 
@@ -124,13 +140,16 @@ class MLAAttention(nn.Module):
     """
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
-                 latent_dim=32, rope_base=100000.0, rope_scaling=None):
+                 latent_dim=32, rope_base=100000.0, rope_scaling=None,
+                 use_sdp=False, qk_norm=True):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
         self.latent_dim = latent_dim
         self.scale = self.head_dim ** 0.5
+        self.use_sdp = use_sdp        # 改进④
+        self.qk_norm = qk_norm        # 改进⑤（默认开，理由见 GQARopeCausalAttention）
 
         self.W_q = nn.Linear(d_model, d_model, bias=bias)
         self.W_dkv = nn.Linear(d_model, latent_dim, bias=bias)          # 输入 → 潜在 c
@@ -174,19 +193,32 @@ class MLAAttention(nn.Module):
         k = repeat_kv(k, n_rep, self.num_heads, self.num_kv_heads)
         v = repeat_kv(v, n_rep, self.num_heads, self.num_kv_heads)
 
-        scores = torch.bmm(q, k.transpose(1, 2)) / self.scale   # (B*H, S, S+offset)
+        # [改进⑤] QK-Norm（MLAV 同款）：见 GQARopeCausalAttention 注释
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
+
+        # 内置因果掩码
         M = causal_bias(q.shape[1], k.shape[1], q.device, q.dtype)
-        scores = scores + M
-        w = F.softmax(scores, dim=-1)
-        w = self.dropout(w)
-        out = torch.bmm(w, v)
+
+        if self.use_sdp:
+            # [改进④] 真·FlashAttention 内核（见 GQARopeCausalAttention 注释）
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=M,
+                                                 dropout_p=self.dropout.p if self.training else 0.0)
+        else:
+            scores = torch.bmm(q, k.transpose(1, 2)) / self.scale   # (B*H, S, S+offset)
+            scores = scores + M
+            w = F.softmax(scores, dim=-1)
+            w = self.dropout(w)
+            out = torch.bmm(w, v)
         out = transpose_output(out, self.num_heads)
         return self.W_o(out), state
 
 
 class MotexV3Block(nn.Module):
     def __init__(self, d_model, num_heads, num_kv_heads, ffn_hidden, dropout, i, max_seq_len,
-                 rope_base=100000.0, rope_scaling=None, attn='gqa', mla_latent_dim=32):
+                 rope_base=100000.0, rope_scaling=None, attn='gqa', mla_latent_dim=32,
+                 use_sdp=False, qk_norm=True):
         super().__init__()
         self.i = i
         self.norm1 = RMSNorm(d_model)
@@ -194,11 +226,13 @@ class MotexV3Block(nn.Module):
             # 改进② MLA：只缓存低维 latent，KV 显存≈1/8（对比见 dev/IMPROVEMENT_LOG.md）
             self.attn = MLAAttention(d_model, num_heads, num_kv_heads, dropout, max_seq_len,
                                      rope_base=rope_base, rope_scaling=rope_scaling,
-                                     latent_dim=mla_latent_dim)
+                                     latent_dim=mla_latent_dim,
+                                     use_sdp=use_sdp, qk_norm=qk_norm)
         else:
             self.attn = GQARopeCausalAttention(d_model, num_heads, num_kv_heads, dropout,
                                                max_seq_len, rope_base=rope_base,
-                                               rope_scaling=rope_scaling)
+                                               rope_scaling=rope_scaling,
+                                               use_sdp=use_sdp, qk_norm=qk_norm)
         self.norm2 = RMSNorm(d_model)
         self.ffn = SwiGLUMLP(d_model, ffn_hidden, dropout)
 
@@ -213,7 +247,7 @@ class MotexV3Block(nn.Module):
 class MotexV3Decoder(nn.Module):
     def __init__(self, vocab_size, d_model, num_layers, num_heads, num_kv_heads,
                  ffn_hidden, dropout, max_seq_len, rope_base=100000.0, rope_scaling=None,
-                 attn='gqa', mla_latent_dim=32):
+                 attn='gqa', mla_latent_dim=32, use_sdp=False, qk_norm=False):
         super().__init__()
         self.num_layers = num_layers
         self.d_model = d_model
@@ -221,7 +255,8 @@ class MotexV3Decoder(nn.Module):
         self.blks = nn.ModuleList([
             MotexV3Block(d_model, num_heads, num_kv_heads, ffn_hidden, dropout, i, max_seq_len,
                          rope_base=rope_base, rope_scaling=rope_scaling,
-                         attn=attn, mla_latent_dim=mla_latent_dim)
+                         attn=attn, mla_latent_dim=mla_latent_dim,
+                         use_sdp=use_sdp, qk_norm=qk_norm)
             for i in range(num_layers)
         ])
 
@@ -241,14 +276,16 @@ class MotexV3(nn.Module):
 
     def __init__(self, vocab_size, d_model=512, num_layers=8, num_heads=8, num_kv_heads=2,
                  ffn_hidden=1024, dropout=0.1, max_seq_len=256,
-                 rope_base=100000.0, rope_scaling=None, attn='gqa', mla_latent_dim=32):
+                 rope_base=100000.0, rope_scaling=None, attn='gqa', mla_latent_dim=32,
+                 use_sdp=False, qk_norm=True):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.decoder = MotexV3Decoder(vocab_size, d_model, num_layers, num_heads,
                                       num_kv_heads, ffn_hidden, dropout, max_seq_len,
                                       rope_base=rope_base, rope_scaling=rope_scaling,
-                                      attn=attn, mla_latent_dim=mla_latent_dim)
+                                      attn=attn, mla_latent_dim=mla_latent_dim,
+                                      use_sdp=use_sdp, qk_norm=qk_norm)
         self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # 权重绑定：embedding 与 LM 头共享，显著降低大词表开销、加速收敛
