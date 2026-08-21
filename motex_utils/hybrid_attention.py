@@ -7,8 +7,8 @@ import torch
 from torch import nn
 
 from .transformer import (DotProductFlashAttention, apply_rotary_pos_emb,
-                          precompute_rotary_emb, repeat_kv, transpose_output,
-                          transpose_qkv)
+                          causal_bias, precompute_rotary_emb, repeat_kv,
+                          transpose_output, transpose_qkv)
 
 
 class DenseAttention(nn.Module):
@@ -55,7 +55,10 @@ class DenseAttention(nn.Module):
         # 与 attention.py 的 GQARopeMultiHeadAttentionKVCache 保持一致。
         if valid_lens is not None:
             valid_lens = torch.repeat_interleave(valid_lens, repeats=self.num_heads, dim=0)
-        out = self.flash_attn(Q, K, V, valid_lens)
+
+        # [修复/回迁] 软通路同样内置因果掩码：训练 total==S 时纯因果；解码时只看历史+自己。
+        M = causal_bias(Q.shape[1], K.shape[1], Q.device, Q.dtype)
+        out = self.flash_attn(Q, K, V, valid_lens, mask=M)
         out = transpose_output(out, self.num_heads)
         return out, state
 

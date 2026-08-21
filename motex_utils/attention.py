@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from .transformer import DotProductFlashAttention
+from .transformer import DotProductFlashAttention, causal_bias
 
 
 class GQARopeMultiHeadAttentionKVCache(nn.Module):
@@ -57,7 +57,10 @@ class GQARopeMultiHeadAttentionKVCache(nn.Module):
         if valid_lens is not None:
             valid_lens = torch.repeat_interleave(valid_lens, repeats=self.num_heads, dim=0)
 
-        output = self.attention(queries, keys, values, valid_lens)
+        # [修复/回迁] 内置因果掩码（不依赖外部 valid_lens 的传法）：
+        #   训练/整段前向 total(=S+query_offset)=S 时即为纯因果方阵；增量解码时只看历史+自己。
+        M = causal_bias(queries.shape[1], keys.shape[1], queries.device, queries.dtype)
+        output = self.attention(queries, keys, values, valid_lens, mask=M)
         output_concat = self.transpose_output(output, self.num_heads)
         return self.W_o(output_concat), state
 

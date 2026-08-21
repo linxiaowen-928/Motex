@@ -57,6 +57,10 @@ forward(tokens, valid_lens=None, state=None) -> (logits, state, aux_loss)
 | Motex v2_1 / v2_2 | + Dense/Sparse 混合注意力（top_k 16 / 8） |
 | Motex v3 | **内置因果掩码**（不依赖外部 valid_lens）+ 权重绑定 + 干净化实现 |
 
+> **因果性说明**：所有版本的注意力现都**内置因果掩码**（训练/预填充/增量生成结构上自洽，
+> 不依赖外部 `valid_lens` 的传法）。这修复了老版本一个隐性根因：若 `valid_lens` 传入整句长度或 None，
+> 训练会变成双向（偷看未来），loss 虚低但生成必崩、不成句。内置掩码后训练即因果，二者一致。
+
 ## 依赖
 
 - `torch`、`numpy`、`matplotlib`、`tqdm`

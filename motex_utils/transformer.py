@@ -43,6 +43,20 @@ def masked_softmax(X, valid_lens):
     return F.softmax(X.reshape(shape), dim=-1)
 
 
+def causal_bias(seq_len, total, device, dtype=torch.float32):
+    """构造 (seq_len, total) 的加法因果掩码（内置，不依赖外部 valid_lens）：
+    - 前 total-seq_len 列 = 历史缓存列，全部放行（0）
+    - 后 seq_len 列 = 当前 token 列，上三角置 -inf（禁止看未来）
+    训练/整段前向时 total==seq_len，即纯因果方阵；增量解码时 seq_len==1，只看历史+自己。
+    """
+    mask = torch.zeros((seq_len, total), device=device, dtype=dtype)
+    if seq_len > 1:
+        tri = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device, dtype=dtype),
+                         diagonal=1)
+        mask[:, total - seq_len:] = tri
+    return mask
+
+
 def precompute_rotary_emb(max_seq_len, d, base=100000):
     theta = 1.0 / (base ** (torch.arange(0, d, 2, dtype=torch.float) / d))
     positions = torch.arange(max_seq_len, dtype=torch.float)
@@ -90,29 +104,33 @@ class RMSNorm(nn.Module):
 
 
 class DotProductAttention(nn.Module):
-    """缩放点积注意力"""
+    """缩放点积注意力（支持加法掩码，如内置因果掩码）"""
 
     def __init__(self, dropout, **kwargs):
         super(DotProductAttention, self).__init__(**kwargs)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries, keys, values, valid_lens=None):
+    def forward(self, queries, keys, values, valid_lens=None, mask=None):
         d = queries.shape[-1]
         scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(d)
+        if mask is not None:
+            scores = scores + mask
         self.attention_weights = masked_softmax(scores, valid_lens)
         return torch.bmm(self.dropout(self.attention_weights), values)
 
 
 class DotProductFlashAttention(nn.Module):
-    """缩放点积注意力"""
+    """缩放点积注意力（支持加法掩码，如内置因果掩码）"""
 
     def __init__(self, dropout, **kwargs):
         super().__init__(**kwargs)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries, keys, values, valid_lens=None):
+    def forward(self, queries, keys, values, valid_lens=None, mask=None):
         d = queries.shape[-1]
         scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(d)
+        if mask is not None:
+            scores = scores + mask
         self.attention_weights = masked_softmax(scores, valid_lens)
         return torch.bmm(self.dropout(self.attention_weights), values)
 
