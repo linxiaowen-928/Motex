@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+matplotlib
+tqdm
+d2l
+deepseek-tokenizer
+# notebook 运行环境
+jupyter
+ipykernel
