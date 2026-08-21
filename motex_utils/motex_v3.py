@@ -45,7 +45,7 @@ class GQARopeCausalAttention(nn.Module):
         self.scale = self.head_dim ** 0.5
         self.use_sdp = use_sdp        # 改进④：出前向走 F.scaled_dot_product_attention(FlashAttention 内核)
         self.qk_norm = qk_norm        # 改进⑤：softmax 前对 Q/K 做 RMSNorm（低精度训练稳定）
-        # 注：qk_norm 默认 True——A/B（dev/IMPROVEMENT_LOG.md 改进项5）显示它域内验证最优、
+        # 注：qk_norm 默认 True——A/B 实验显示它域内验证最优、
         # 外推 CE 从 11.6→6.1 的大幅提升且零成本，故作为 motex_v3 默认；SDPA(use_sdp) 在本规模
         # (d512/8L/单批) 无速度收益，保留为可选（大模型/长上下文/大批量场景启用）。
 
@@ -136,7 +136,7 @@ class MLAAttention(nn.Module):
        这里 Q 保持 GQA 同款全量投影，K 恢复后再统一施加绝对位置 RoPE（等价且更直观）。
     2) 缓存只存 latent，解码时整段恢复 K/V 再 RoPE（简单、显存最优；计算略增，
        大模型可用“每步只恢复新 token”的优化）。
-    - A/B 对比实验见 dev/IMPROVEMENT_LOG.md「改进项 2」。
+    - 经 A/B 对比实验验证：KV 缓存 1/8、域内略优、外推更优。
     """
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
@@ -165,7 +165,7 @@ class MLAAttention(nn.Module):
         self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
 
     def kv_cache_bytes_per_token(self):
-        """每 token 每层 KV 缓存字节数（GQA 对比见 IMPROVEMENT_LOG 改进项2）"""
+        """每 token 每层 KV 缓存字节数（MLA 与 GQA 缓存量对比见类 docstring）"""
         return 4 * self.latent_dim
 
     def forward(self, x, state, i):
@@ -223,7 +223,7 @@ class MotexV3Block(nn.Module):
         self.i = i
         self.norm1 = RMSNorm(d_model)
         if attn == 'mla':
-            # 改进② MLA：只缓存低维 latent，KV 显存≈1/8（对比见 dev/IMPROVEMENT_LOG.md）
+            # 改进② MLA：只缓存低维 latent，KV 显存≈1/8（经 A/B 实验验证）
             self.attn = MLAAttention(d_model, num_heads, num_kv_heads, dropout, max_seq_len,
                                      rope_base=rope_base, rope_scaling=rope_scaling,
                                      latent_dim=mla_latent_dim,

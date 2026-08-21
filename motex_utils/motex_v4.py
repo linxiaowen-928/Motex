@@ -2,12 +2,12 @@
 
 v4 = v3（内置因果掩码 / 权重绑定 / 统一接口）+ 已验证的组合默认：
   1. MLA（Multi-head Latent Attention，attn='mla'）：KV 缓存降到 GQA 的 1/8，
-     A/B（docs/IMPROVEMENT_LOG.md 改进项2）显示域内略优、外推更优。
+     A/B 实验已验证域内略优、外推更优。
   2. QK-Norm（qk_norm=True）：softmax 前对 Q/K 做 RMSNorm，
-     A/B（改进项5）显示域内最优 + 外推 CE 11.6→6.1，默认开启。
-  3. bf16/AMP 训练（改进项3，2× 吞吐、0 NaN）：训练侧推荐（见 dev/ 训练脚本）。
-其余保持可选：rope_scaling（改进项1，实验为负结果，默认关）、use_sdp（改进项4，
-本规模无提速，大模型/长上下文场景再开）。
+     A/B 实验已验证域内最优 + 外推 CE 11.6→6.1，默认开启。
+  3. bf16/AMP 训练（改进③，2× 吞吐、0 NaN）：训练侧推荐。
+其余保持可选：rope_scaling（RoPE 外推，本规模实验为负结果，默认关）、use_sdp
+（真 FlashAttention，本规模无提速，大模型/长上下文场景再开）。
 
 实现上 v4 直接复用 motex_v3.MotexV3（全部机制在 v3 中已实现并注释），
 MotexV4 只是把『已验证组合』固化为默认参数：attn='mla'、qk_norm=True。
