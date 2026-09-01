@@ -191,18 +191,37 @@ class GQARopeCausalAttention(nn.Module):
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 
-        # 内置因果掩码：历史列全放行，当前 S 列施加上三角 -inf（训练 offset=0 即纯因果；解码 S=1 全 0）
-        total = S + offset
-        mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
-        if S > 1:
-            tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
-                                        dtype=q.dtype), diagonal=1)
-            mask[:, offset:] = tri
-
         if self.use_sdp:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
-                                                 dropout_p=self.dropout.p if self.training else 0.0)
+            # 4D 视图触发 flash attention（3D 输入会回退 math 路径，慢 ~9 倍）
+            B_h, S_q, hd = q.shape
+            B = B_h // self.num_heads
+            q4 = q.view(B, self.num_heads, S_q, hd)
+            k4 = k.view(B, self.num_heads, S_q, hd)
+            v4 = v.view(B, self.num_heads, S_q, hd)
+            if offset == 0:
+                # 训练（纯因果）：融合 kernel + is_causal，免去掩码构建
+                out = F.scaled_dot_product_attention(
+                    q4, k4, v4, is_causal=True,
+                    dropout_p=self.dropout.p if self.training else 0.0)
+            else:
+                # 增量解码（offset>0，罕见）：构建因果掩码后走融合 kernel
+                total = S + offset
+                mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
+                if S > 1:
+                    tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
+                                                dtype=q.dtype), diagonal=1)
+                    mask[:, offset:] = tri
+                out = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=mask,
+                                                     dropout_p=self.dropout.p if self.training else 0.0)
+            out = out.reshape(B_h, S_q, hd)
         else:
+            # 内置因果掩码：历史列全放行，当前 S 列施加上三角 -inf（训练 offset=0 即纯因果；解码 S=1 全 0）
+            total = S + offset
+            mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
+            if S > 1:
+                tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
+                                            dtype=q.dtype), diagonal=1)
+                mask[:, offset:] = tri
             scores = torch.bmm(q, k.transpose(1, 2)) / self.scale
             scores = scores + mask
             w = F.softmax(scores, dim=-1)
@@ -306,12 +325,21 @@ class MLAAttention(nn.Module):
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 
-        M = causal_bias(q.shape[1], k.shape[1], q.device, q.dtype)
-
         if self.use_sdp:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=M,
-                                                 dropout_p=self.dropout.p if self.training else 0.0)
+            # 4D 视图触发 flash attention（3D 输入回退 math 路径，慢 ~9 倍）
+            B_h, S_q, hd = q.shape
+            B = B_h // self.num_heads
+            causal = (S_q == k.shape[1])
+            out = F.scaled_dot_product_attention(
+                q.view(B, self.num_heads, S_q, hd),
+                k.view(B, self.num_heads, S_q, hd),
+                v.view(B, self.num_heads, S_q, hd),
+                is_causal=True if causal else False,
+                attn_mask=None if causal else causal_bias(S_q, k.shape[1], q.device, q.dtype),
+                dropout_p=self.dropout.p if self.training else 0.0)
+            out = out.reshape(B_h, S_q, hd)
         else:
+            M = causal_bias(q.shape[1], k.shape[1], q.device, q.dtype)
             scores = torch.bmm(q, k.transpose(1, 2)) / self.scale   # (B*H, S, S+offset)
             scores = scores + M
             w = F.softmax(scores, dim=-1)

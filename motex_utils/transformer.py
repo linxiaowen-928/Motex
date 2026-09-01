@@ -98,9 +98,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        x = x.float()
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x / rms * self.weight).to(x.dtype)
+        # 融合 RMSNorm（单 kernel，内部 fp32 累积）：替代 手写 float→pow→sqrt→div→to 的
+        # 多 kernel 链（大模型每步 65+ 次 RMSNorm，小 kernel 启动开销主导训练耗时）
+        return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
 
 class DotProductAttention(nn.Module):
