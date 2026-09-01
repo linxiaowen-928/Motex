@@ -13,20 +13,19 @@ Motex/
 ├── gpt/                      # GPT 系列（模型定义 notebook）
 │   ├── GPT_v1.ipynb          # RoPE + 标准多头注意力 + FFN
 │   └── GPT_v2.ipynb          # + KV-Cache、AMP、断点训练
-├── motex/                    # Motex 系列（模型装配在 notebook 内）
-│   ├── Motex_v1.ipynb        # RMSNorm + GQA + KV-Cache（Pre-Norm）
-│   ├── Motex_v2.ipynb        # + SwiGLU + MoE
-│   ├── Motex_v2_1.ipynb      # + HybridAttention（Dense/Sparse）
-│   ├── Motex_v2_2.ipynb      # SwiGLU + MoE + HybridAttention（完整版）
-│   ├── Motex_v3.ipynb        # 内置因果掩码 + 权重绑定 + 可选改进（干净版）
-│   └── Motex_v4.ipynb        # MLA + QK-Norm 默认组合（已验证改进）
-├── motex_utils/              # ★ 共享构建块（默认各版本 notebook 复用，不含整模型）
+├── motex/                    # Motex 系列（正式模型包）
+│   ├── model.py              # ★ MotexV3/V4 正式装配（Decoder/Block/LM Head 权重绑定/生成）
+│   ├── __init__.py           # 导出 MotexV3 / MotexV4 / MotexBlock / MotexDecoder / generate
+│   └── Motex_v1~v4.ipynb     # 演进过程 notebook（自底向上教学线）
+├── motex_utils/              # ★ 共享构建块（模型与训练通用组件）
 │   ├── transformer.py        # RoPE / 掩码 softmax / causal_bias / GQA 辅助 / RMSNorm / FFN 等基础件
-│   ├── attention.py          # GQARopeMultiHeadAttentionKVCache / GQARopeCausalAttention / MLAAttention
+│   ├── attention.py          # GQARopeMultiHeadAttentionKVCache / GQARopeCausalAttention / MLAAttention（+decoupled-RoPE 变体）
 │   ├── moe.py                # SwiGLU / MoE 路由器与专家 FFN
 │   ├── hybrid_attention.py   # DenseAttention / SparseAttention(Router)
+│   ├── mamba.py              # S4SSM / MambaBlock / build_hybrid（Mamba 混合架构，方案 C）
 │   ├── bpe.py                # 轻量纯 Python BPE 分词器（模型侧工具）
-│   └── training.py           # 共享训练/评估/推理/断点工具（各 notebook 复用）
+│   ├── training.py           # 共享训练/评估/推理/断点工具
+│   └── train_large.py        # 大语料训练框架（mmap 分块顺序读 / eval_metrics / lr_schedule）
 ├── requirements.txt
 └── README.md
 ```
@@ -71,20 +70,22 @@ forward(tokens, valid_lens=None, state=None) -> (logits, state, aux_loss)
 ## 模型用法
 
 ```python
-# 模型类在各自 notebook 内装配定义（与 v1/v2 风格一致）：
-# 打开 motex/Motex_v3.ipynb 或 Motex_v4.ipynb 运行即得 MotexV3 / MotexV4。
-# 这里以共享组件示例说明从代码侧使用 motex_utils：
+# 正式入口：motex 包（模型装配见 motex/model.py，各 notebook 为演进教学线）
+from motex import MotexV3, MotexV4, generate
+
+net = MotexV4(vocab_size=16000, d_model=1024, num_layers=12, num_heads=8,
+              num_kv_heads=4, ffn_hidden=2048, attn='mla', mla_latent_dim=32, qk_norm=True)
+logits, state, aux_loss = net(tokens, None, None)   # 统一接口 (batch, seq, vocab)
+
+# 或直接用共享组件（如 MLA 注意力）：
 import torch
 from motex_utils.attention import MLAAttention
-
 attn = MLAAttention(d_model=256, num_heads=4, num_kv_heads=1, dropout=0.1, max_seq_len=128)
-x = torch.randn(2, 32, 256)
-out, _ = attn(x, None, 0)          # 共享注意力组件可直接使用
-print(out.shape)
+out, _ = attn(torch.randn(2, 32, 256), None, 0)
 ```
 
-> 数据加载为仓库外接口：训练前请在对应 notebook 的「数据加载（placeholder）」处
-> 接入返回 `(tokens, labels, valid_lens)` 的迭代器；真实数据/训练/验证/测试脚本在 `dev/`。
+> 数据加载为仓库外接口：训练前在对应训练脚本接入返回 `(tokens, labels)` 的迭代器；
+> 真实数据/语料/训练/验证脚本在 `dev/`（不入库）。
 
 ## dev/（不入库）
 
