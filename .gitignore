@@ -28,3 +28,15 @@ dev/
 .coverage
 .idea/
 .vscode/
+
+# 备份文件（*.bak_* 等）
+*.bak_*
+*.orig
+*.rej
+
+# 内部方案文档（含数据源链接/版权声明，不进公开仓库）
+doc/
+
+# 训练用 notebook（含本地数据引用 wx_corpus3 等，非模型核心）
+motex/Motex_V4_BASE.ipynb
+motex/Motex_V4_SMALL.ipynb

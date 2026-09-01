@@ -232,7 +232,10 @@ class MLAAttention(nn.Module):
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
                  latent_dim=32, rope_base=100000.0, rope_scaling=None,
-                 use_sdp=False, qk_norm=True):
+                 use_sdp=False, qk_norm=True, decoupled_rope=False):
+        """decoupled_rope（简化变体，2026-08-24）：
+        位置编码只施加于 head_dim 后半（位置段），前半（内容段）不旋转——
+        DeepSeek MLA decoupled-RoPE 的轻量近似（不拆 latent 缓存，零结构变化）、默认 False 兼容。"""
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -241,6 +244,8 @@ class MLAAttention(nn.Module):
         self.scale = self.head_dim ** 0.5
         self.use_sdp = use_sdp
         self.qk_norm = qk_norm   # 默认开，理由见 GQARopeCausalAttention 注释
+        self.decoupled_rope = decoupled_rope
+        self._rope_half = self.head_dim // 2 if decoupled_rope else 0
 
         self.W_q = nn.Linear(d_model, d_model, bias=bias)
         self.W_dkv = nn.Linear(d_model, latent_dim, bias=bias)          # 输入 → 潜在 c
@@ -269,7 +274,14 @@ class MLAAttention(nn.Module):
         if (not self.training) and state is not None and state[0] is not None and state[0][i] is not None:
             cache_c = state[0][i]                               # 只缓存 latent：(B, off, d_c)
             offset = cache_c.shape[1]
-        q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
+        if self.decoupled_rope:
+            r = self._rope_half                       # 位置段维数（r 个 dim = r/2 对）
+            pairs = r // 2
+            q = torch.cat([q[..., :r],
+                           apply_rotary_pos_emb(q[..., r:], self.cos[:, :pairs], self.sin[:, :pairs],
+                                                offset=offset)], dim=-1)
+        else:
+            q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
 
         c = self.W_dkv(x)                                       # (B, S, d_c)
         c_all = torch.cat([cache_c, c], dim=1) if cache_c is not None else c
@@ -278,7 +290,13 @@ class MLAAttention(nn.Module):
 
         k = transpose_qkv(self.W_upK(c_all), self.num_kv_heads) # (B*kv, off+S, hd)
         v = transpose_qkv(self.W_upV(c_all), self.num_kv_heads)
-        k = apply_rotary_pos_emb(k, self.cos, self.sin)         # 全列绝对位置（offset=0）
+        if self.decoupled_rope:
+            r = self._rope_half
+            pairs = r // 2
+            k = torch.cat([k[..., :r],
+                           apply_rotary_pos_emb(k[..., r:], self.cos[:, :pairs], self.sin[:, :pairs])], dim=-1)
+        else:
+            k = apply_rotary_pos_emb(k, self.cos, self.sin)     # 全列绝对位置（offset=0）
 
         n_rep = self.num_heads // self.num_kv_heads
         k = repeat_kv(k, n_rep, self.num_heads, self.num_kv_heads)
