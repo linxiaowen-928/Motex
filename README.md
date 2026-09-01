@@ -1,10 +1,9 @@
 # Motex
 
-从零手写、自底向上演进的 **Decoder-only 语言模型**系列（原学习项目代号 "Moss"，此处更名 Motex）。
+从零手写、自底向上演进的 **Decoder-only 语言模型**系列。
 
 本仓库只包含**模型本体**（架构 + 共享模型组件 + 各版本 notebook），
-**不含**：数据加载/数据集、训练运行脚本、测试/验证脚本、过程文档与断点产物 ——
-这些都整理在 `dev/` 目录（已 git 忽略，不随仓库分发）。
+**不含**：数据加载/数据集、训练运行脚本、测试/验证脚本、过程文档与断点产物。
 
 ## 目录结构
 
@@ -68,7 +67,7 @@ forward(tokens, valid_lens=None, state=None) -> (logits, state, aux_loss)
 
 - `torch`、`numpy`、`matplotlib`、`tqdm`
 - `d2l`（仅 Animator/Timer/try_gpu，notebook 用）
-- `deepseek-tokenizer`（提供 `ds_token` 分词与词表；字符/BPE 训练请在 `dev/` 管线中自行构建）
+- `deepseek-tokenizer`（提供 `ds_token` 分词与词表；字符/BPE 训练请自行构建）
 
 ## 模型用法
 
@@ -86,9 +85,4 @@ print(out.shape)
 ```
 
 > 数据加载为仓库外接口：训练前请在对应 notebook 的「数据加载（placeholder）」处
-> 接入返回 `(tokens, labels, valid_lens)` 的迭代器；真实数据/训练/验证/测试脚本在 `dev/`。
-
-## dev/（不入库）
-
-`dev/` 存有本次开发过程所用的训练管线、语料构建、多变体对比、自定义训练实验、
-冒烟/扩展验证、过程报告与聊天室接入等，均被 `.gitignore` 忽略，不随本仓库分发。
+> 接入返回 `(tokens, labels, valid_lens)` 的迭代器；真实数据/训练/验证/测试脚本不随本仓库分发。
