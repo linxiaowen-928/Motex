@@ -201,8 +201,9 @@ class GQARopeCausalAttention(nn.Module):
             B_h, S_q, hd = q.shape
             B = B_h // self.num_heads
             q4 = q.view(B, self.num_heads, S_q, hd)
-            k4 = k.view(B, self.num_heads, S_q, hd)
-            v4 = v.view(B, self.num_heads, S_q, hd)
+            # 推理（offset>0）时 k/v 序列更长（历史 + 当前），必须用各自长度 view
+            k4 = k.view(B, self.num_heads, k.shape[1], hd)
+            v4 = v.view(B, self.num_heads, v.shape[1], hd)
             if offset == 0:
                 # 训练（纯因果）：融合 kernel + is_causal，免去掩码构建
                 out = F.scaled_dot_product_attention(
@@ -339,8 +340,8 @@ class MLAAttention(nn.Module):
             causal = (S_q == k.shape[1])
             out = F.scaled_dot_product_attention(
                 q.view(B, self.num_heads, S_q, hd),
-                k.view(B, self.num_heads, S_q, hd),
-                v.view(B, self.num_heads, S_q, hd),
+                k.view(B, self.num_heads, k.shape[1], hd),   # 推理时 k 序列更长（历史+当前）
+                v.view(B, self.num_heads, v.shape[1], hd),
                 is_causal=True if causal else False,
                 attn_mask=None if causal else causal_bias(S_q, k.shape[1], q.device, q.dtype),
                 dropout_p=self.dropout.p if self.training else 0.0)
