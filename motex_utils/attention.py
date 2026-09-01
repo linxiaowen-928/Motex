@@ -34,7 +34,10 @@ class GQARopeMultiHeadAttentionKVCache(nn.Module):
         self.W_v = nn.Linear(value_size, self.num_kv_heads * self.head_dim, bias=bias)
         self.W_o = nn.Linear(num_hiddens, num_hiddens, bias=bias)
 
-        self.cos, self.sin = self.precompute_rotary_emb(max_seq_len, self.head_dim)
+        # register_buffer：cos/sin 随模型 .cuda() 移动（普通属性留在 CPU 会每层每次 forward 传输）
+        cos, sin = self.precompute_rotary_emb(max_seq_len, self.head_dim)
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
 
     def forward(self, queries, keys, values, valid_lens, state, i):
         queries = self.W_q(queries)
@@ -157,7 +160,9 @@ class GQARopeCausalAttention(nn.Module):
             alpha = float(rope_scaling.get('alpha', 1.0))
             base_ = rope_base * (alpha ** (self.head_dim / (self.head_dim - 2.0)))
         self.rope_base = base_
-        self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+        cos, sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
 
     def forward(self, x, state, i):
         # x: (B, S, d_model) -> (out: B, S, d_model, state)
@@ -277,7 +282,9 @@ class MLAAttention(nn.Module):
         if rope_scaling and rope_scaling.get('type') == 'ntk':
             alpha = float(rope_scaling.get('alpha', 1.0))
             base_ = rope_base * (alpha ** (self.head_dim / (self.head_dim - 2.0)))
-        self.cos, self.sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+        cos, sin = precompute_rotary_emb(max_seq_len, self.head_dim, base=base_)
+        self.register_buffer('cos', cos)
+        self.register_buffer('sin', sin)
 
     def kv_cache_bytes_per_token(self):
         """每 token 每层 KV 缓存字节数（MLA 与 GQA 缓存量对比见类 docstring）"""
