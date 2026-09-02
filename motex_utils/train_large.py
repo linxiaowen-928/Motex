@@ -23,7 +23,13 @@ from torch import nn
 
 
 def load_ids_mmap(path):
-    """mmap 加载 token ids（int64）。支持 .pt（torch mmap）与 .raw（int64 裸文件流式产物）。"""
+    """mmap 加载 token ids。支持 .pt（torch mmap）、.raw（int64 裸文件）与 u16 裸文件
+    （corpus_ids_u16.pt 等：np.memmap 真文件映射，不计私有提交内存——torch.load(mmap=True)
+    在 Windows 按私有提交 +文件大小，大语料会把训练内存推到物理上限外）。"""
+    if 'u16' in path or path.endswith('.u16'):
+        import numpy as np
+        mm = np.memmap(path, dtype=np.uint16, mode='r')
+        return torch.from_numpy(mm)   # 保持 uint16 视图，切片级 .long()（见 chunked_seq_iter）
     if path.endswith('.raw'):
         import numpy as np
         size = os.path.getsize(path) // 8
@@ -44,7 +50,8 @@ def chunked_seq_iter(ids, seq, seed=7, block_tokens=16_000_000):
             m = len(b)
             st = r.randrange(0, min(seq, max(1, m - 1)))
             while st + seq + 1 < m:
-                yield b[st:st + seq], b[st + 1:st + seq + 1]
+                # u16 视图切片 → long（embedding 索引需要；每块 2KB 临时，避免全量 .long() 拷贝）
+                yield b[st:st + seq].long(), b[st + 1:st + seq + 1].long()
                 st += seq
 
 
@@ -55,23 +62,29 @@ def eval_metrics(net, val_ids, seq, device, batches=64, extrap_len=512):
     - acc：上述窗口的 top-1 逐字准确率
     - extrap：验证集前段 512 窗口“看 256 续 256”的外推 CE（只统计后段）
     """
-    loss = nn.CrossEntropyLoss(reduction='none')
-    it = chunked_seq_iter(val_ids, seq, seed=3)
-    tot1 = n1 = a1 = 0
-    for _ in range(batches):
-        x, y = next(it)
-        lg, _, _ = net(x.unsqueeze(0).to(device), None, None)
-        ce = loss(lg.reshape(-1, net.vocab_size), y.reshape(-1).to(device))
-        tot1 += ce.sum().item(); n1 += ce.numel()
-        a1 += (lg.reshape(-1, net.vocab_size).argmax(-1) == y.reshape(-1).to(device)).sum().item()
-    tot2 = n2 = 0
-    for st in range(0, 512 * 16, 512):
-        c = val_ids[st:st + extrap_len]
-        lg, _, _ = net(c[:extrap_len - 1].unsqueeze(0).to(device), None, None)
-        ce = loss(lg.reshape(-1, net.vocab_size), c[1:extrap_len].unsqueeze(0).to(device).reshape(-1)).reshape(1, extrap_len - 1)
-        tot2 += ce[:, (extrap_len - 1) // 2:].sum().item()
-        n2 += ce[:, (extrap_len - 1) // 2:].numel()
-    return tot1 / max(1, n1), a1 / max(1, n1), tot2 / max(1, n2)
+    was_training = net.training
+    net.eval()   # 切 eval：否则 dropout 在验证时激活，里程碑数值带噪声
+    try:
+        loss = nn.CrossEntropyLoss(reduction='none')
+        it = chunked_seq_iter(val_ids, seq, seed=3)
+        tot1 = n1 = a1 = 0
+        for _ in range(batches):
+            x, y = next(it)
+            lg, _, _ = net(x.unsqueeze(0).to(device), None, None)
+            ce = loss(lg.reshape(-1, net.vocab_size), y.reshape(-1).to(device))
+            tot1 += ce.sum().item(); n1 += ce.numel()
+            a1 += (lg.reshape(-1, net.vocab_size).argmax(-1) == y.reshape(-1).to(device)).sum().item()
+        tot2 = n2 = 0
+        for st in range(0, 512 * 16, 512):
+            c = val_ids[st:st + extrap_len].long()
+            lg, _, _ = net(c[:extrap_len - 1].unsqueeze(0).to(device), None, None)
+            ce = loss(lg.reshape(-1, net.vocab_size), c[1:extrap_len].unsqueeze(0).to(device).reshape(-1)).reshape(1, extrap_len - 1)
+            tot2 += ce[:, (extrap_len - 1) // 2:].sum().item()
+            n2 += ce[:, (extrap_len - 1) // 2:].numel()
+        return tot1 / max(1, n1), a1 / max(1, n1), tot2 / max(1, n2)
+    finally:
+        if was_training:
+            net.train()
 
 
 def lr_schedule(opt, sched, total, warmup, lr, lr_override=0.0):
