@@ -44,3 +44,6 @@ motex/Motex_V4_SMALL.ipynb
 # 璁粌渚ц閰嶏紙dev 璁粌鑴氭湰浣跨敤锛岄潪 notebook 鏁欏绾匡紝涓嶅叆搴擄級
 motex/model.py
 motex/__init__.py
+
+# agent 纪律文档（不追踪）
+AGENTS.md

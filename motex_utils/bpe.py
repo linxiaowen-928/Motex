@@ -230,7 +230,9 @@ class BPE:
         self.stoi = {v: k for k, v in self.itos.items()}
         self.merges = {tuple(map(int, k.split(','))): c for k, c in d['merges'].items()}
         self.vocab_size = len(self.itos)
-        self.byte_mode = any(k.startswith('<b') for k in self.itos.values())
+        # byte_mode 判定：需 ≥200 个完整字节槽 '<bXX>'（startswith 会误中 '<bos>' 等字面 token）
+        self.byte_mode = sum(1 for v in self.itos.values()
+                             if re.fullmatch(r'<b[0-9A-F]{2}>', v)) >= 200
 
 
 if __name__ == '__main__':
