@@ -120,7 +120,18 @@ class DotProductAttention(nn.Module):
 
 
 class DotProductFlashAttention(nn.Module):
-    """缩放点积注意力（支持加法掩码，如内置因果掩码）"""
+    """缩放点积注意力（支持加法掩码，如内置因果掩码）——【手写教学实现，学习/对照用】。
+
+    说明（2026-09-08 标注）：本类名为历史遗留（v1/v2 时代），实际上是完全手写的
+    bmm + masked_softmax 三步实现：物化 (…, S_q, S_k) 分数矩阵再 softmax，
+    显存 O(S²)、无任何融合。训练与推理【不要】走它（比 SDPA/flash 慢 9~30 倍）。
+
+    高效路径：GQARopeCausalAttention / MLAAttention 的 use_sdp=True（默认）→
+    torch.nn.functional.scaled_dot_product_attention（CUDA 自动选 FlashAttention /
+    memory-efficient）。保留本类目的：① 逐步教学（分数→mask→softmax→加权和）；
+    ② 与 SDPA 结果做数值对照验证。对应 SDPA 版参考：
+    motex_utils/attention.py 各 use_sdp=False 分支（同款手写 bmm 实现）。
+    """
 
     def __init__(self, dropout, **kwargs):
         super().__init__(**kwargs)

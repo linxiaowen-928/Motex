@@ -135,12 +135,17 @@ class GQARopeCausalAttention(nn.Module):
       域内验证最优 + 外推 CE 11.6→6.1，零成本，故默认开启。
     - rope_scaling={'type':'ntk','alpha':k}（默认 None）：NTK-Aware RoPE 外推，
       把旋转基频按 base*alpha^(d/(d-2)) 拉伸，可外推约 alpha 倍训练长度（本规模实验为负结果，默认关）。
-    - use_sdp=True（默认 False）：走 F.scaled_dot_product_attention（CUDA 上自动选真 FlashAttention
+    - use_sdp=True（默认，2026-09-08 起）：走 F.scaled_dot_product_attention（CUDA 上自动选真 FlashAttention
+      等高效内核；4D 视图 + is_causal 触发，训练/推理统一走此路径）
+      False：手写 bmm+softmax 教学实现（学习对照/数值验证用，勿用于训练——物化 SxS 分数，慢 9~30 倍）
       内核，免物化大分数矩阵）；本规模(d512/8L/单批)无提速，大模型/长上下文/大批量再启用。
     """
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
-                 rope_base=100000.0, rope_scaling=None, use_sdp=False, qk_norm=True):
+                 rope_base=100000.0, rope_scaling=None, use_sdp=True, qk_norm=True,
+                 rope_off=False):
+        """use_sdp=True（默认）：SDPA 高效内核；False：手写 bmm 教学实现（对照用）。
+        rope_off=True：NoPE 变体（2026-09-08，Kimi K3 路线对照；不施加任何位置编码）。"""
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -148,6 +153,7 @@ class GQARopeCausalAttention(nn.Module):
         self.scale = self.head_dim ** 0.5
         self.use_sdp = use_sdp
         self.qk_norm = qk_norm
+        self.rope_off = rope_off
 
         self.W_q = nn.Linear(d_model, d_model, bias=bias)
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=bias)
@@ -179,8 +185,9 @@ class GQARopeCausalAttention(nn.Module):
             cache_k, cache_v = state[0][i]
             offset = cache_k.shape[1]
 
-        q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
-        k = apply_rotary_pos_emb(k, self.cos, self.sin, offset=offset)
+        if not self.rope_off:
+            q = apply_rotary_pos_emb(q, self.cos, self.sin, offset=offset)
+            k = apply_rotary_pos_emb(k, self.cos, self.sin, offset=offset)
 
         if offset:
             k = torch.cat([cache_k, k], dim=1)
@@ -209,14 +216,17 @@ class GQARopeCausalAttention(nn.Module):
                 out = F.scaled_dot_product_attention(
                     q4, k4, v4, is_causal=True,
                     dropout_p=self.dropout.p if self.training else 0.0)
+            elif S == 1:
+                # 增量解码（单 query）：可见全部历史+自己 → 无需掩码。
+                # 修复（2026-09-09）：广播形状 (1,total) 掩码会被 flash 后端错误处理。
+                out = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=None, dropout_p=0.0)
             else:
-                # 增量解码（offset>0，罕见）：构建因果掩码后走融合 kernel
+                # 罕见：多 query 带历史（chunked 解码），显式因果掩码
                 total = S + offset
                 mask = torch.zeros((S, total), device=q.device, dtype=q.dtype)
-                if S > 1:
-                    tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
-                                                dtype=q.dtype), diagonal=1)
-                    mask[:, offset:] = tri
+                tri = torch.triu(torch.full((S, S), float('-inf'), device=q.device,
+                                            dtype=q.dtype), diagonal=1)
+                mask[:, offset:] = tri
                 out = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=mask,
                                                      dropout_p=self.dropout.p if self.training else 0.0)
             out = out.reshape(B_h, S_q, hd)
@@ -257,10 +267,11 @@ class MLAAttention(nn.Module):
 
     def __init__(self, d_model, num_heads, num_kv_heads, dropout, max_seq_len, bias=False,
                  latent_dim=32, rope_base=100000.0, rope_scaling=None,
-                 use_sdp=False, qk_norm=True, decoupled_rope=False):
+                 use_sdp=True, qk_norm=True, decoupled_rope=False, rope_off=False):
         """decoupled_rope（简化变体，2026-08-24）：
         位置编码只施加于 head_dim 后半（位置段），前半（内容段）不旋转——
-        DeepSeek MLA decoupled-RoPE 的轻量近似（不拆 latent 缓存，零结构变化）、默认 False 兼容。"""
+        DeepSeek MLA decoupled-RoPE 的轻量近似（不拆 latent 缓存，零结构变化）、默认 False 兼容。
+        rope_off=True：NoPE 变体（2026-09-08，Kimi K3 路线对照；不施加任何位置编码）。"""
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -270,6 +281,7 @@ class MLAAttention(nn.Module):
         self.use_sdp = use_sdp
         self.qk_norm = qk_norm   # 默认开，理由见 GQARopeCausalAttention 注释
         self.decoupled_rope = decoupled_rope
+        self.rope_off = rope_off
         self._rope_half = self.head_dim // 2 if decoupled_rope else 0
 
         self.W_q = nn.Linear(d_model, d_model, bias=bias)
@@ -301,7 +313,9 @@ class MLAAttention(nn.Module):
         if (not self.training) and state is not None and state[0] is not None and state[0][i] is not None:
             cache_c = state[0][i]                               # 只缓存 latent：(B, off, d_c)
             offset = cache_c.shape[1]
-        if self.decoupled_rope:
+        if self.rope_off:
+            pass            # NoPE：不施加任何位置编码
+        elif self.decoupled_rope:
             r = self._rope_half                       # 位置段维数（r 个 dim = r/2 对）
             pairs = r // 2
             q = torch.cat([q[..., :r],
@@ -317,7 +331,9 @@ class MLAAttention(nn.Module):
 
         k = transpose_qkv(self.W_upK(c_all), self.num_kv_heads) # (B*kv, off+S, hd)
         v = transpose_qkv(self.W_upV(c_all), self.num_kv_heads)
-        if self.decoupled_rope:
+        if self.rope_off:
+            pass            # NoPE
+        elif self.decoupled_rope:
             r = self._rope_half
             pairs = r // 2
             k = torch.cat([k[..., :r],
@@ -338,13 +354,32 @@ class MLAAttention(nn.Module):
             B_h, S_q, hd = q.shape
             B = B_h // self.num_heads
             causal = (S_q == k.shape[1])
-            out = F.scaled_dot_product_attention(
-                q.view(B, self.num_heads, S_q, hd),
-                k.view(B, self.num_heads, k.shape[1], hd),   # 推理时 k 序列更长（历史+当前）
-                v.view(B, self.num_heads, v.shape[1], hd),
-                is_causal=True if causal else False,
-                attn_mask=None if causal else causal_bias(S_q, k.shape[1], q.device, q.dtype),
-                dropout_p=self.dropout.p if self.training else 0.0)
+            if causal:
+                # 训练/整段前向：融合 kernel + is_causal
+                out = F.scaled_dot_product_attention(
+                    q.view(B, self.num_heads, S_q, hd),
+                    k.view(B, self.num_heads, k.shape[1], hd),
+                    v.view(B, self.num_heads, v.shape[1], hd),
+                    is_causal=True,
+                    dropout_p=self.dropout.p if self.training else 0.0)
+            elif S_q == 1:
+                # 增量解码（单 query，可见全部历史+自己）：无需掩码。
+                # 修复（2026-09-09）：此前传广播形状 (1,total) 全零掩码，
+                # flash 后端会错误处理 → 第 2 步起输出与全序列不一致（KV-cache 退化根因）。
+                out = F.scaled_dot_product_attention(
+                    q.view(B, self.num_heads, 1, hd),
+                    k.view(B, self.num_heads, k.shape[1], hd),
+                    v.view(B, self.num_heads, v.shape[1], hd),
+                    attn_mask=None,
+                    dropout_p=0.0)
+            else:
+                # 罕见：多 query 带历史（chunked 解码），显式掩码
+                out = F.scaled_dot_product_attention(
+                    q.view(B, self.num_heads, S_q, hd),
+                    k.view(B, self.num_heads, k.shape[1], hd),
+                    v.view(B, self.num_heads, v.shape[1], hd),
+                    attn_mask=causal_bias(S_q, k.shape[1], q.device, q.dtype),
+                    dropout_p=self.dropout.p if self.training else 0.0)
             out = out.reshape(B_h, S_q, hd)
         else:
             M = causal_bias(q.shape[1], k.shape[1], q.device, q.dtype)
